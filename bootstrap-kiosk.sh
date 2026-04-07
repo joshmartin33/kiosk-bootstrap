@@ -4,6 +4,21 @@ set -euo pipefail
 # Raspberry Pi Kiosk Bootstrap — V2 (Simple)
 # Version: v2.1
 
+run_user_systemctl() {
+  local user="$1"; shift
+  local uid
+  uid="$(id -u "$user")"
+
+  sudo loginctl enable-linger "$user" >/dev/null 2>&1 || true
+  sudo systemctl start "user@${uid}.service" >/dev/null 2>&1 || true
+
+  sudo -u "$user" -H env \
+    XDG_RUNTIME_DIR="/run/user/${uid}" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+    systemctl --user "$@"
+}
+
+
 KIOSK_URL="${KIOSK_URL:-https://tv.zira.us}"
 MIDDAY_RESTART="12:00:00"
 USER_NAME="${SUDO_USER:-$(whoami)}"
@@ -72,7 +87,7 @@ as_user "cat > '$BIN_DIR/kiosk-watchdog.sh' <<'EOF'
 #!/usr/bin/env bash
 export DISPLAY=:0
 if ! pgrep -x chromium >/dev/null; then
-  systemctl --user restart kiosk.service
+  run_user_systemctl "$USER_NAME" restart kiosk.service
 fi
 EOF"
 as_user "chmod +x '$BIN_DIR/kiosk-watchdog.sh'"
@@ -93,8 +108,8 @@ EOF"
 
 # Enable everything
 sudo loginctl enable-linger "$USER_NAME"
-as_user "systemctl --user daemon-reload"
-as_user "systemctl --user enable --now kiosk.service kiosk-midday.timer kiosk-watchdog.timer"
+as_user "run_user_systemctl "$USER_NAME" daemon-reload"
+as_user "run_user_systemctl "$USER_NAME" enable --now kiosk.service kiosk-midday.timer kiosk-watchdog.timer"
 
 echo "Bootstrap complete."
 ``
