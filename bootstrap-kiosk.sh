@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Raspberry Pi Kiosk Bootstrap — V2 (Hardened)
-# Version: v2.2
+# Raspberry Pi Kiosk Bootstrap — V2 (Hardened + Remote-safe)
+# Version: v2.3
 # Model: systemd --user only, no LX autostart, no cron
 
 KIOSK_URL="${KIOSK_URL:-https://tv.zira.us}"
 MIDDAY_RESTART="${MIDDAY_RESTART:-12:00:00}"
 WATCHDOG_INTERVAL="${WATCHDOG_INTERVAL:-5min}"
+
+# When run via sudo, configure the *target* kiosk user
 USER_NAME="${SUDO_USER:-$(whoami)}"
 
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
@@ -22,7 +24,6 @@ as_user() {
   sudo -u "$USER_NAME" -H bash -lc "$*"
 }
 
-# Always run systemctl --user against the correct bus for the target user
 run_user_systemctl() {
   local user="$1"; shift
   local uid
@@ -32,6 +33,7 @@ run_user_systemctl() {
   sudo loginctl enable-linger "$user" >/dev/null 2>&1 || true
   sudo systemctl start "user@${uid}.service" >/dev/null 2>&1 || true
 
+  # Run systemctl against the correct user bus
   sudo -u "$user" -H env \
     XDG_RUNTIME_DIR="/run/user/${uid}" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
@@ -96,7 +98,7 @@ Type=oneshot
 ExecStart=/bin/systemctl --user restart kiosk.service
 EOF"
 
-# watchdog script (runs inside user manager; use systemctl --user directly)
+# watchdog script (runs inside user manager)
 as_user "cat > '$BIN_DIR/kiosk-watchdog.sh' <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -130,11 +132,8 @@ Type=oneshot
 ExecStart=%h/bin/kiosk-watchdog.sh
 EOF"
 
-# 5) Enable and start units (DO NOT run via as_user; use wrapper)
+# 5) Enable and start units (IMPORTANT: call wrapper directly, not via as_user)
 run_user_systemctl "$USER_NAME" daemon-reload
 run_user_systemctl "$USER_NAME" enable --now kiosk.service kiosk-midday.timer kiosk-watchdog.timer
 
 log "Bootstrap complete."
-log "Verify with:"
-log "  systemctl --user status kiosk.service"
-log "  systemctl --user list-timers | egrep 'kiosk-midday|kiosk-watchdog'"
