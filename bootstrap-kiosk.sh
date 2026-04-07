@@ -1,14 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Raspberry Pi Kiosk Bootstrap — V2 (Simple)
-# Version: v2.1
+# Raspberry Pi Kiosk Bootstrap — V2 (Hardened)
+# Version: v2.2
+# Model: systemd --user only, no LX autostart, no cron
 
+KIOSK_URL="${KIOSK_URL:-https://tv.zira.us}"
+MIDDAY_RESTART="${MIDDAY_RESTART:-12:00:00}"
+WATCHDOG_INTERVAL="${WATCHDOG_INTERVAL:-5min}"
+USER_NAME="${SUDO_USER:-$(whoami)}"
+
+USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
+SYSTEMD_DIR="$USER_HOME/.config/systemd/user"
+AUTOSTART_DIR="$USER_HOME/.config/autostart"
+AUTOSTART_DISABLED_DIR="$USER_HOME/.config/autostart.disabled"
+BIN_DIR="$USER_HOME/bin"
+
+log(){ printf '%s\n' "$*"; }
+
+as_user() {
+  sudo -u "$USER_NAME" -H bash -lc "$*"
+}
+
+# Always run systemctl --user against the correct bus for the target user
 run_user_systemctl() {
   local user="$1"; shift
   local uid
   uid="$(id -u "$user")"
 
+  # Ensure user manager can run without GUI login
   sudo loginctl enable-linger "$user" >/dev/null 2>&1 || true
   sudo systemctl start "user@${uid}.service" >/dev/null 2>&1 || true
 
@@ -18,39 +38,26 @@ run_user_systemctl() {
     systemctl --user "$@"
 }
 
+log "Configuring kiosk for user: $USER_NAME"
+log "Kiosk URL: $KIOSK_URL"
 
-KIOSK_URL="${KIOSK_URL:-https://tv.zira.us}"
-MIDDAY_RESTART="12:00:00"
-USER_NAME="${SUDO_USER:-$(whoami)}"
+# 1) Disable LX autostart (move aside)
+as_user "mkdir -p '$AUTOSTART_DISABLED_DIR'"
+as_user "if [ -d '$AUTOSTART_DIR' ] && compgen -G '$AUTOSTART_DIR/*.desktop' >/dev/null; then mv '$AUTOSTART_DIR'/*.desktop '$AUTOSTART_DISABLED_DIR'/; fi"
 
-USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
-SYSTEMD_DIR="$USER_HOME/.config/systemd/user"
-AUTOSTART="$USER_HOME/.config/autostart"
-AUTOSTART_DISABLED="$USER_HOME/.config/autostart.disabled"
-BIN_DIR="$USER_HOME/bin"
+# 2) Remove legacy cron kiosk jobs (best effort, preserve unrelated cron)
+as_user "crontab -l 2>/dev/null | grep -vE '(chromium|vcgencmd|--kiosk|--app=)' | crontab - 2>/dev/null || true"
 
-as_user() { sudo -u "$USER_NAME" -H bash -lc "$*"; }
-
-echo "Configuring kiosk for user: $USER_NAME"
-echo "Kiosk URL: $KIOSK_URL"
-
-# Disable LX autostart
-as_user "mkdir -p '$AUTOSTART_DISABLED'"
-as_user "if [ -d '$AUTOSTART' ]; then mv '$AUTOSTART'/*.desktop '$AUTOSTART_DISABLED'/ 2>/dev/null || true; fi"
-
-# Remove legacy cron kiosk jobs (best effort)
-as_user "crontab -l 2>/dev/null | grep -vE '(chromium|vcgencmd)' | crontab - 2>/dev/null || true"
-
-# Ensure Chromium
-if ! command -v chromium >/dev/null; then
+# 3) Ensure Chromium
+if ! command -v chromium >/dev/null 2>&1; then
   sudo apt update
-  sudo apt install chromium -y
+  sudo apt install -y chromium
 fi
 
-# systemd user units
+# 4) Install systemd user units + scripts
 as_user "mkdir -p '$SYSTEMD_DIR' '$BIN_DIR'"
 
-# Kiosk service
+# kiosk.service
 as_user "cat > '$SYSTEMD_DIR/kiosk.service' <<EOF
 [Unit]
 Description=Chromium Kiosk
@@ -67,49 +74,67 @@ RestartSec=3
 WantedBy=default.target
 EOF"
 
-# Midday restart
+# midday restart (timer + oneshot service)
 as_user "cat > '$SYSTEMD_DIR/kiosk-midday.timer' <<EOF
+[Unit]
+Description=Restart kiosk at midday
+
 [Timer]
 OnCalendar=*-*-* ${MIDDAY_RESTART}
 Persistent=true
+
 [Install]
 WantedBy=timers.target
 EOF"
 
 as_user "cat > '$SYSTEMD_DIR/kiosk-midday.service' <<'EOF'
+[Unit]
+Description=Restart kiosk at midday
+
 [Service]
 Type=oneshot
 ExecStart=/bin/systemctl --user restart kiosk.service
 EOF"
 
-# Watchdog
+# watchdog script (runs inside user manager; use systemctl --user directly)
 as_user "cat > '$BIN_DIR/kiosk-watchdog.sh' <<'EOF'
 #!/usr/bin/env bash
+set -euo pipefail
 export DISPLAY=:0
-if ! pgrep -x chromium >/dev/null; then
-  run_user_systemctl "$USER_NAME" restart kiosk.service
+
+if ! pgrep -x chromium >/dev/null 2>&1; then
+  systemctl --user restart kiosk.service
 fi
 EOF"
 as_user "chmod +x '$BIN_DIR/kiosk-watchdog.sh'"
 
+# watchdog timer + service
 as_user "cat > '$SYSTEMD_DIR/kiosk-watchdog.timer' <<EOF
+[Unit]
+Description=Run kiosk watchdog
+
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
+OnUnitActiveSec=${WATCHDOG_INTERVAL}
+
 [Install]
 WantedBy=timers.target
 EOF"
 
 as_user "cat > '$SYSTEMD_DIR/kiosk-watchdog.service' <<'EOF'
+[Unit]
+Description=Kiosk watchdog
+
 [Service]
 Type=oneshot
 ExecStart=%h/bin/kiosk-watchdog.sh
 EOF"
 
-# Enable everything
-sudo loginctl enable-linger "$USER_NAME"
-as_user "run_user_systemctl "$USER_NAME" daemon-reload"
-as_user "run_user_systemctl "$USER_NAME" enable --now kiosk.service kiosk-midday.timer kiosk-watchdog.timer"
+# 5) Enable and start units (DO NOT run via as_user; use wrapper)
+run_user_systemctl "$USER_NAME" daemon-reload
+run_user_systemctl "$USER_NAME" enable --now kiosk.service kiosk-midday.timer kiosk-watchdog.timer
 
-echo "Bootstrap complete."
-``
+log "Bootstrap complete."
+log "Verify with:"
+log "  systemctl --user status kiosk.service"
+log "  systemctl --user list-timers | egrep 'kiosk-midday|kiosk-watchdog'"
