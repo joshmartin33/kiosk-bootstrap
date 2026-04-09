@@ -1,31 +1,53 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Raspberry Pi Kiosk Bootstrap — V2.6.1 (Corrected)
-# Safe for retrofitting running devices
-# Supports high-frequency dashboard refresh workloads
+# Raspberry Pi Kiosk Bootstrap — V2.7
+# DBus-safe remote execution
+# Works over SSH / Pi Connect
+# No OS-level package modifications
 
 KIOSK_URL="https://tv.zira.us"
 
-# Restart strategy (proven to prevent white screens)
 WATCHDOG_INTERVAL="5min"
 MAX_RUNTIME_SEC=$((90 * 60))       # 90 minutes
 PERIODIC_RESTART_SEC=$((75 * 60))  # 75 minutes
 
-USER_NAME="${SUDO_USER:-$(whoami)}"
+TARGET_USER="${TARGET_USER:-}"
+USER_NAME="${TARGET_USER:-${SUDO_USER:-$(whoami)}}"
+
+if [[ "$(id -u)" -eq 0 && -z "${SUDO_USER:-}" && -z "${TARGET_USER:-}" ]]; then
+  echo "ERROR: Running as root without TARGET_USER."
+  echo "Use: TARGET_USER=<kioskuser> curl ... | sudo bash"
+  exit 1
+fi
+
+USER_UID="$(id -u "$USER_NAME")"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 SYSTEMD_DIR="$USER_HOME/.config/systemd/user"
 BIN_DIR="$USER_HOME/bin"
 
 log(){ printf '%s\n' "$*"; }
 
-log "Applying V2.6.1 kiosk for user: $USER_NAME"
+# ------------------------------------------------------------
+# DBus-safe wrapper for systemctl --user
+# ------------------------------------------------------------
+run_user_systemctl() {
+  sudo loginctl enable-linger "$USER_NAME" >/dev/null 2>&1 || true
+  sudo systemctl start "user@${USER_UID}.service" >/dev/null 2>&1 || true
+
+  sudo -u "$USER_NAME" -H env \
+    XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${USER_UID}/bus" \
+    systemctl --user "$@"
+}
+
+log "Applying V2.7 kiosk for user: $USER_NAME"
 
 mkdir -p "$SYSTEMD_DIR" "$BIN_DIR"
 
-# -----------------------------
-# systemd user kiosk.service
-# -----------------------------
+# ------------------------------------------------------------
+# systemd --user kiosk service (VALID UNIT FORMAT)
+# ------------------------------------------------------------
 cat > "$SYSTEMD_DIR/kiosk.service" <<EOF
 [Unit]
 Description=Chromium Kiosk
@@ -42,9 +64,9 @@ RestartSec=3
 WantedBy=default.target
 EOF
 
-# -----------------------------
-# Watchdog (preventative)
-# -----------------------------
+# ------------------------------------------------------------
+# Watchdog (preventative restart)
+# ------------------------------------------------------------
 cat > "$BIN_DIR/kiosk-watchdog.sh" <<EOF
 #!/usr/bin/env bash
 set -e
@@ -76,9 +98,9 @@ OnUnitActiveSec=$WATCHDOG_INTERVAL
 WantedBy=timers.target
 EOF
 
-# -----------------------------
-# Periodic renderer hygiene
-# -----------------------------
+# ------------------------------------------------------------
+# Periodic renderer hygiene restart
+# ------------------------------------------------------------
 cat > "$SYSTEMD_DIR/kiosk-periodic.service" <<EOF
 [Service]
 Type=oneshot
@@ -94,10 +116,10 @@ AccuracySec=2min
 WantedBy=timers.target
 EOF
 
-# -----------------------------
-# Enable services
-# -----------------------------
-systemctl --user daemon-reload
-systemctl --user enable --now kiosk.service kiosk-watchdog.timer kiosk-periodic.timer
+# ------------------------------------------------------------
+# Enable everything safely
+# ------------------------------------------------------------
+run_user_systemctl daemon-reload
+run_user_systemctl enable --now kiosk.service kiosk-watchdog.timer kiosk-periodic.timer
 
-log "V2.6.1 kiosk applied."
+log "✅ V2.7 kiosk applied successfully."
